@@ -21,6 +21,7 @@ public class DownloadManager {
         try {
             // 1️⃣ Get file size from server
             long fileSize = getFileSize(fileURL);
+            System.out.println("Hellooooooooooooo");
             if (fileSize <= 0) {
                 System.out.println("Could not determine file size!");
                 return;
@@ -45,7 +46,7 @@ public class DownloadManager {
 
             latch.await();
             pool.shutdown();
-            System.out.println("✅ Download completed successfully!");
+            System.out.println("Download completed successfully!");
 
         } catch (Exception e) {
             e.printStackTrace();
