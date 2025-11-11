@@ -5,11 +5,22 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Coordinates the entire download process and controls pause/resume.
+ */
 public class DownloadManager {
     private final String fileURL;
     private final String outputFile;
     private final int numThreads;
+
+    private volatile boolean paused = false; // pause flag
+    private volatile boolean stopped = false; // quit flag
+
+    private CountDownLatch latch;
+    private ProgressReporter reporter;
+    private Thread reporterThread;
 
     public DownloadManager(String fileURL, String outputFile, int numThreads) {
         this.fileURL = fileURL;
@@ -19,71 +30,93 @@ public class DownloadManager {
 
     public void startDownload() {
         try {
-            // 1️⃣ Get file size from server
             long fileSize = getFileSize(fileURL);
-            System.out.println("Hellooooooooooooo");
             if (fileSize <= 0) {
                 System.out.println("Could not determine file size!");
                 return;
             }
             System.out.println("File size: " + fileSize + " bytes");
 
-            // 2️⃣ Create output file placeholder
             RandomAccessFile output = new RandomAccessFile(outputFile, "rw");
             output.setLength(fileSize);
             output.close();
 
-            // 3️⃣ Calculate ranges
             List<Range> ranges = RangeCalculator.calculateRanges(fileSize, numThreads);
 
-            // 4️⃣ Create thread pool
             ExecutorService pool = Executors.newFixedThreadPool(numThreads);
-            CountDownLatch latch = new CountDownLatch(numThreads);
+            latch = new CountDownLatch(numThreads);
+            AtomicLong downloadedBytes = new AtomicLong(0);
+
+            reporter = new ProgressReporter(fileSize, downloadedBytes, this);
+            reporterThread = new Thread(reporter);
+            reporterThread.start();
 
             for (Range range : ranges) {
-                pool.execute(new SegmentDownloader(fileURL, outputFile, range, latch));
+                pool.execute(new SegmentDownloader(fileURL, outputFile, range, latch, downloadedBytes, this));
             }
 
             latch.await();
+            stopReporter();
             pool.shutdown();
-            System.out.println("Download completed successfully!");
+
+            if (!stopped) {
+                System.out.println("\n✅ Download completed successfully!");
+            }
 
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
-//    private long getFileSize(String fileURL) throws IOException {
-//        HttpURLConnection conn = (HttpURLConnection) new URL(fileURL).openConnection();
-//        conn.setRequestMethod("HEAD");
-//        //conn.getInputStream().close();
-//        return conn.getContentLengthLong();
-//    }
+    private long getFileSize(String fileURL) throws IOException {
+        HttpURLConnection conn = (HttpURLConnection) new URL(fileURL).openConnection();
+        conn.setRequestProperty("Range", "bytes=0-0");
+        conn.connect();
 
-    private static long getFileSize(String fileURL) throws IOException {
-        try {
-            URL url = new URL(fileURL);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("HEAD");
-            conn.connect();
+        String contentRange = conn.getHeaderField("Content-Range");
+        if (contentRange != null && contentRange.contains("/")) {
+            return Long.parseLong(contentRange.split("/")[1]);
+        }
+        long length = conn.getContentLengthLong();
+        conn.disconnect();
+        return length;
+    }
 
-            int responseCode = conn.getResponseCode();
-            if (responseCode != HttpURLConnection.HTTP_OK) {
-                throw new IOException("Server returned non-OK status: " + responseCode);
-            }
+    // --- Pause/Resume Controls ---
+    public synchronized void pause() {
+        paused = true;
+        System.out.println("⏸️ Download paused.");
+    }
 
-            long fileSize = conn.getContentLengthLong();
-            if (fileSize <= 0) {
-                throw new IOException("Could not determine file size.");
-            }
+    public synchronized void resume() {
+        paused = false;
+        notifyAll(); // wake up paused threads
+        System.out.println("▶️ Download resumed.");
+    }
 
-            return fileSize;
+    public synchronized void stop() {
+        stopped = true;
+        paused = false;
+        notifyAll();
+        stopReporter();
+    }
 
-        } catch (Exception e) {
-            System.err.println("Error fetching file size: " + e.getMessage());
-            e.printStackTrace();
-            return -1;
+    public synchronized void waitIfPaused() throws InterruptedException {
+        while (paused && !stopped) {
+            wait();
         }
     }
 
+    public boolean isStopped() {
+        return stopped;
+    }
+
+    private void stopReporter() {
+        if (reporter != null) reporter.stop();
+        if (reporterThread != null) {
+            try {
+                reporterThread.join();
+            } catch (InterruptedException ignored) {}
+        }
+    }
 }
