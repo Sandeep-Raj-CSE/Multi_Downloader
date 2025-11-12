@@ -1,14 +1,15 @@
 package com.sandeep.downloader;
 
 import com.sandeep.downloader.model.Range;
+import com.sandeep.downloader.model.metaData;
+
 import java.io.*;
 import java.net.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Handles downloading a specific byte range of the file.
- * Pauses gracefully when DownloadManager.pause() is invoked.
+ * Downloads a specific byte range with retry and resume support.
  */
 public class SegmentDownloader implements Runnable {
     private final String fileURL;
@@ -17,46 +18,59 @@ public class SegmentDownloader implements Runnable {
     private final CountDownLatch latch;
     private final AtomicLong downloadedBytes;
     private final DownloadManager manager;
+    private final int maxRetries;
 
     public SegmentDownloader(String fileURL, String outputFile, Range range,
-                             CountDownLatch latch, AtomicLong downloadedBytes, DownloadManager manager) {
+                             CountDownLatch latch, AtomicLong downloadedBytes,
+                             DownloadManager manager, int maxRetries) {
         this.fileURL = fileURL;
         this.outputFile = outputFile;
         this.range = range;
         this.latch = latch;
         this.downloadedBytes = downloadedBytes;
         this.manager = manager;
+        this.maxRetries = maxRetries;
     }
 
     @Override
     public void run() {
-        try (RandomAccessFile output = new RandomAccessFile(outputFile, "rw")) {
-            HttpURLConnection conn = (HttpURLConnection) new URL(fileURL).openConnection();
-            conn.setRequestProperty("Range", "bytes=" + range.start + "-" + range.end);
-            conn.connect();
+        int attempt = 0;
+        while (attempt < maxRetries && !manager.isStopped() && !range.completed) {
+            attempt++;
+            try (RandomAccessFile output = new RandomAccessFile(outputFile, "rw")) {
+                long startByte = range.start + range.downloadedBytes;
+                HttpURLConnection conn = (HttpURLConnection) new URL(fileURL).openConnection();
+                conn.setRequestProperty("Range", "bytes=" + startByte + "-" + range.end);
+                conn.connect();
 
-            try (InputStream in = conn.getInputStream()) {
-                output.seek(range.start);
-                byte[] buffer = new byte[8192];
-                int bytesRead;
+                if (conn.getResponseCode() != 206 && conn.getResponseCode() != 200)
+                    throw new IOException("Invalid response: " + conn.getResponseCode());
 
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    // Check for stop signal
-                    if (manager.isStopped()) return;
+                try (InputStream in = conn.getInputStream()) {
+                    output.seek(startByte);
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
 
-                    // Check for pause
-                    manager.waitIfPaused();
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                        if (manager.isStopped()) return;
+                        manager.waitIfPaused();
 
-                    output.write(buffer, 0, bytesRead);
-                    downloadedBytes.addAndGet(bytesRead);
+                        output.write(buffer, 0, bytesRead);
+                        range.downloadedBytes += bytesRead;
+                        downloadedBytes.addAndGet(bytesRead);
+                    }
+
+                    range.completed = true;
+                    System.out.println(Thread.currentThread().getName() + " finished " + range);
+                    ResumeManager.saveMetadata(manager.getMetadata());
+                    break; // ✅ success, break retry loop
                 }
-            }
 
-            System.out.println(Thread.currentThread().getName() + " finished " + range);
-        } catch (Exception e) {
-            System.err.println("❌ Error downloading " + range + ": " + e.getMessage());
-        } finally {
-            latch.countDown();
+            } catch (Exception e) {
+                System.err.println("⚠️ Attempt " + attempt + " failed for " + range + ": " + e.getMessage());
+                try { Thread.sleep(1000 * attempt); } catch (InterruptedException ignored) {}
+            }
         }
+        latch.countDown();
     }
 }

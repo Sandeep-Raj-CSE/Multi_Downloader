@@ -1,6 +1,8 @@
 package com.sandeep.downloader;
 
+import com.sandeep.downloader.model.metaData;
 import com.sandeep.downloader.model.Range;
+
 import java.io.*;
 import java.net.*;
 import java.util.*;
@@ -8,19 +10,17 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Coordinates the entire download process and controls pause/resume.
+ * Coordinates multi-threaded downloads with resume & retry support.
  */
 public class DownloadManager {
     private final String fileURL;
     private final String outputFile;
     private final int numThreads;
+    private final int maxRetries = 3; // ✅ new
+    private volatile boolean paused = false;
+    private volatile boolean stopped = false;
 
-    private volatile boolean paused = false; // pause flag
-    private volatile boolean stopped = false; // quit flag
-
-    private CountDownLatch latch;
-    private ProgressReporter reporter;
-    private Thread reporterThread;
+    private metaData metadata;
 
     public DownloadManager(String fileURL, String outputFile, int numThreads) {
         this.fileURL = fileURL;
@@ -30,42 +30,68 @@ public class DownloadManager {
 
     public void startDownload() {
         try {
-            long fileSize = getFileSize(fileURL);
-            if (fileSize <= 0) {
-                System.out.println("Could not determine file size!");
+            // Load existing metadata if available
+            metadata = ResumeManager.loadMetadata(outputFile + ".meta.json");
+
+            if (metadata != null && metadata.completed) {
+                System.out.println("✅ File already downloaded!");
                 return;
             }
-            System.out.println("File size: " + fileSize + " bytes");
 
+            long fileSize;
+            List<Range> ranges;
+
+            if (metadata == null) {
+                fileSize = getFileSize(fileURL);
+                ranges = RangeCalculator.calculateRanges(fileSize, numThreads);
+                metadata = new metaData(fileURL, outputFile, fileSize, ranges);
+            } else {
+                fileSize = metadata.fileSize;
+                ranges = metadata.ranges;
+                System.out.println("⏩ Resuming previous download...");
+            }
+
+            // Prepare file
             RandomAccessFile output = new RandomAccessFile(outputFile, "rw");
             output.setLength(fileSize);
             output.close();
 
-            List<Range> ranges = RangeCalculator.calculateRanges(fileSize, numThreads);
-
             ExecutorService pool = Executors.newFixedThreadPool(numThreads);
-            latch = new CountDownLatch(numThreads);
-            AtomicLong downloadedBytes = new AtomicLong(0);
+            CountDownLatch latch = new CountDownLatch(numThreads);
+            AtomicLong downloadedBytes = new AtomicLong(totalDownloadedSoFar(ranges));
 
-            reporter = new ProgressReporter(fileSize, downloadedBytes, this);
-            reporterThread = new Thread(reporter);
+            ProgressReporter reporter = new ProgressReporter(fileSize, downloadedBytes, this);
+            Thread reporterThread = new Thread(reporter);
             reporterThread.start();
 
+            // Launch only incomplete segments
             for (Range range : ranges) {
-                pool.execute(new SegmentDownloader(fileURL, outputFile, range, latch, downloadedBytes, this));
+                if (!range.completed) {
+                    pool.execute(new SegmentDownloader(fileURL, outputFile, range, latch, downloadedBytes, this, maxRetries));
+                } else {
+                    latch.countDown();
+                }
             }
 
             latch.await();
-            stopReporter();
+            reporter.stop();
+            reporterThread.join();
             pool.shutdown();
 
             if (!stopped) {
+                metadata.completed = true;
+                ResumeManager.saveMetadata(metadata);
                 System.out.println("\n✅ Download completed successfully!");
+                ResumeManager.deleteMetadata(outputFile + ".meta.json");
             }
 
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private long totalDownloadedSoFar(List<Range> ranges) {
+        return ranges.stream().mapToLong(r -> r.downloadedBytes).sum();
     }
 
     private long getFileSize(String fileURL) throws IOException {
@@ -82,41 +108,15 @@ public class DownloadManager {
         return length;
     }
 
-    // --- Pause/Resume Controls ---
-    public synchronized void pause() {
-        paused = true;
-        System.out.println("⏸️ Download paused.");
-    }
-
-    public synchronized void resume() {
-        paused = false;
-        notifyAll(); // wake up paused threads
-        System.out.println("▶️ Download resumed.");
-    }
-
-    public synchronized void stop() {
-        stopped = true;
-        paused = false;
-        notifyAll();
-        stopReporter();
-    }
+    // --- Pause/Resume controls ---
+    public synchronized void pause() { paused = true; System.out.println("⏸️ Paused."); }
+    public synchronized void resume() { paused = false; notifyAll(); System.out.println("▶️ Resumed."); }
+    public synchronized void stop() { stopped = true; paused = false; notifyAll(); }
 
     public synchronized void waitIfPaused() throws InterruptedException {
-        while (paused && !stopped) {
-            wait();
-        }
+        while (paused && !stopped) { wait(); }
     }
 
-    public boolean isStopped() {
-        return stopped;
-    }
-
-    private void stopReporter() {
-        if (reporter != null) reporter.stop();
-        if (reporterThread != null) {
-            try {
-                reporterThread.join();
-            } catch (InterruptedException ignored) {}
-        }
-    }
+    public boolean isStopped() { return stopped; }
+    public metaData getMetadata() { return metadata; }
 }
