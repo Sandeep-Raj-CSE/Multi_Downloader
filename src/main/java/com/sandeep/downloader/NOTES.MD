@@ -336,17 +336,3 @@ try { while(paused) condition.await(); } finally { lock.unlock(); }
 Q: Modify to show ETA and avg speed.
 A: Track startTime and lastMeasuredTime/bytes. avgSpeed = totalDownloaded / (now - startTime). ETA = (total - downloaded) / avgSpeed.
 
-Q: Use ThreadPoolExecutor with custom names.
-A:
-
-ExecutorService pool = new ThreadPoolExecutor(n, n, 0L, TimeUnit.MILLISECONDS,
-new LinkedBlockingQueue<>(), r -> new Thread(r, "dl-worker-"+threadId.incrementAndGet()));
-
-
-If you want, I can:
-
-Turn these answers into a printable 2-page cheat sheet PDF for interview prep.
-
-Generate example responses (60–90 seconds) you can memorize for each category.
-
-Produce unit tests or the resume-after-restart implementation next.
